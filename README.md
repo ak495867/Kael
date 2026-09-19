@@ -1,6 +1,6 @@
 # Kael Strategy Reference
 
-Ten strategies from the Pareto frontier, each explained with formulas, a flow diagram and test results. All formulas use GitHub-rendered LaTeX and Mermaid.
+Ten strategies from the Pareto frontier, each explained with formulas, a flow diagram and test results.
 
 |#|File|Expression|Cx|OOS Sharpe|
 |-|-|-|-|-|
