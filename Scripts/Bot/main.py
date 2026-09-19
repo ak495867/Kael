@@ -7,6 +7,7 @@ import yfinance as yf
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from scipy import stats
 
 warnings.filterwarnings("ignore")
 np.random.seed(42)
@@ -33,41 +34,40 @@ UNIVERSES = {
     ],
     "crypto": [
         "BTC-USD","ETH-USD","BNB-USD","SOL-USD","XRP-USD","ADA-USD",
-        "DOGE-USD","DOT-USD","LTC-USD","LINK-USD","AVAX-USD","ATOM-USD",
-        "NEAR-USD","ALGO-USD","APT-USD"
+        "DOGE-USD","DOT-USD","LTC-USD","LINK-USD","AVAX-USD","ATOM-USD"
     ],
     "treasuries_and_credit": [
         "SHY","IEI","IEF","TLH","TLT","TIP","LQD","HYG","EMB","MBB","AGG"
     ],
     "mixed_assets": [
         "SPY","QQQ","IWM","TLT","IEF","LQD","HYG","GLD","SLV","USO",
-        "DBC","VNQ","EFA","EEM","FXI","EWJ","BTC-USD","ETH-USD"
+        "DBC","VNQ","EFA","EEM","FXI","EWJ"
     ],
 }
 
 TIMEFRAMES = {
-    "1d":  {"interval": "1d",  "period": None,    "ann": 252},
-    "1h":  {"interval": "1h",  "period": "730d",  "ann": 1638},
-    "1wk": {"interval": "1wk", "period": None,    "ann": 52},
+    "1d":  {"interval": "1d",  "period": None,   "ann": 252},
+    "1h":  {"interval": "1h",  "period": "730d", "ann": 1638},
+    "1wk": {"interval": "1wk", "period": None,   "ann": 52},
 }
 
 RUNS = [
-    ("us_equities",            "1d"),
-    ("sector_etfs",            "1d"),
-    ("international",          "1d"),
-    ("crypto",                 "1d"),
-    ("treasuries_and_credit",  "1d"),
-    ("mixed_assets",           "1d"),
-    ("sector_etfs",            "1h"),
-    ("crypto",                 "1h"),
-    ("mixed_assets",           "1h"),
-    ("us_equities",            "1wk"),
-    ("sector_etfs",            "1wk"),
+    ("us_equities",           "1d"),
+    ("sector_etfs",           "1d"),
+    ("international",         "1d"),
+    ("crypto",                "1d"),
+    ("treasuries_and_credit", "1d"),
+    ("mixed_assets",          "1d"),
+    ("sector_etfs",           "1h"),
+    ("crypto",                "1h"),
+    ("mixed_assets",          "1h"),
+    ("us_equities",           "1wk"),
+    ("sector_etfs",           "1wk"),
 ]
 
 START = "2018-01-01"
 END   = pd.Timestamp.today().strftime("%Y-%m-%d")
-VOL_TARGET = 0.12
+VOL_TARGET = 0.10
 MAX_LEV = 2.0
 
 
@@ -102,7 +102,7 @@ def normalise(w):
 
 
 def compute_regime(prices, ann):
-    window = max(30, int(0.8 * ann))
+    window = max(40, int(0.8 * ann))
     bench = prices.mean(axis=1)
     ma = bench.rolling(window, min_periods=max(10, window // 4)).mean()
     uptrend = (bench > ma).astype(float)
@@ -114,29 +114,54 @@ def scaled_params(ann):
     def sv(x, lo):
         return max(lo, int(round(x * s)))
     return {
-        "momentum":        {"lookback": sv(252, 40), "skip": sv(21, 3), "holding": sv(21, 3), "quantile": 0.2},
+        "momentum": {
+            "lookbacks": (sv(126, 30), sv(189, 40), sv(252, 50), sv(378, 60)),
+            "skip": sv(21, 3), "holding": sv(21, 3), "quantile": 0.2
+        },
         "q4_breakout":     {"high_window": sv(252, 40), "hold_days": sv(21, 3)},
-        "turn_of_month":   {"pre_days": 2, "post_days": 3},
+        "turn_of_month":   {"pre_days": 2, "post_days": 4},
         "mean_reversion":  {"lookback": sv(5, 2), "holding": sv(5, 2), "quantile": 0.2},
-        "low_vol":         {"lookback": sv(63, 15), "holding": sv(21, 3), "quantile": 0.3},
+        "low_vol":         {"lookback": sv(63, 15), "holding": sv(21, 3), "quantile": 0.25},
         "dual_momentum":   {"lookback": sv(126, 30), "skip": sv(21, 3), "holding": sv(21, 3)},
         "trend_following": {"fast": sv(20, 4), "slow": sv(100, 12), "holding": sv(5, 1)},
+        "short_term_reversal": {
+            "lookback": sv(5, 2), "holding": sv(5, 2),
+            "quantile": 0.2, "trend_window": sv(200, 40),
+        },
+        "cs_neutral_momentum": {
+            "lookback": sv(252, 50), "skip": sv(21, 3), "holding": sv(21, 3),
+            "quantile": 0.1, "vol_window": sv(126, 30),
+        },
+        "pead_proxy": {
+            "move_threshold": 0.04, "holding": sv(21, 3), "trend_window": sv(200, 40),
+        },
     }
 
 
-def momentum_signal(prices, lookback, skip, holding, quantile, uptrend=None, short_cap=0.3):
+def vol_scaled_momentum(prices, lookback, skip, holding, quantile, uptrend):
+    ret = prices.pct_change()
     mom = prices.shift(skip) / prices.shift(lookback) - 1.0
-    ranks = mom.rank(axis=1, pct=True)
-    long_mask = ranks >= (1 - quantile)
-    short_mask = ranks <= quantile
+    vol = ret.rolling(max(20, lookback // 4), min_periods=10).std()
+    score = mom / vol.replace(0, np.nan)
+    ma = prices.rolling(lookback, min_periods=max(10, lookback // 3)).mean()
+    above = (prices > ma).astype(float)
+    ranks = score.rank(axis=1, pct=True)
+    long_mask = (ranks >= (1 - quantile)) & (above > 0)
+    short_mask = (ranks <= quantile) & (above < 1)
     long_w = long_mask.div(long_mask.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
     short_w = short_mask.div(short_mask.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
     if uptrend is not None:
-        gate = 0.2 + 0.8 * (1.0 - uptrend)
+        gate = 0.15 + 0.85 * (1.0 - uptrend)
         short_w = short_w.mul(gate, axis=0)
-    short_w = short_w * short_cap
-    w = long_w - short_w
+    w = long_w - 0.3 * short_w
     return w.iloc[::holding].reindex(prices.index, method="ffill").fillna(0)
+
+
+def ensemble_momentum(prices, params, uptrend):
+    ws = [vol_scaled_momentum(prices, lb, params["skip"], params["holding"],
+                              params["quantile"], uptrend)
+          for lb in params["lookbacks"]]
+    return sum(ws) / len(ws)
 
 
 def q4_breakout_signal(prices, high_window, hold_days):
@@ -156,35 +181,38 @@ def turn_of_month_signal(prices, pre_days, post_days):
     ym = pd.Series([(d.year, d.month) for d in idx], index=idx)
     max_day = day.groupby(ym).transform("max")
     mask = ((day > (max_day - pre_days)) | (day <= post_days)).astype(float)
-    ncols = prices.shape[1]
-    w = np.outer(mask.values, np.ones(ncols) / ncols)
+    w = np.outer(mask.values, np.ones(prices.shape[1]) / prices.shape[1])
     return pd.DataFrame(w, index=idx, columns=prices.columns)
 
 
 def mean_reversion_signal(prices, lookback, holding, quantile):
     ret = prices.pct_change(lookback)
+    ma = prices.rolling(max(20, 3 * lookback), min_periods=10).mean()
+    above = (prices > ma).astype(float)
     ranks = ret.rank(axis=1, pct=True)
-    long_mask = ranks <= quantile
+    long_mask = (ranks <= quantile) & (above > 0)
     long_w = long_mask.div(long_mask.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
-    w = long_w
-    return w.iloc[::holding].reindex(prices.index, method="ffill").fillna(0)
+    return long_w.iloc[::holding].reindex(prices.index, method="ffill").fillna(0)
 
 
 def low_vol_signal(prices, lookback, holding, quantile):
     vol = prices.pct_change().rolling(lookback).std()
+    ma = prices.rolling(max(20, lookback * 2), min_periods=10).mean()
+    above = (prices > ma).astype(float)
     ranks = vol.rank(axis=1, pct=True)
-    long_mask = ranks <= quantile
+    long_mask = (ranks <= quantile) & (above > 0)
     long_w = long_mask.div(long_mask.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
-    w = long_w
-    return w.iloc[::holding].reindex(prices.index, method="ffill").fillna(0)
+    return long_w.iloc[::holding].reindex(prices.index, method="ffill").fillna(0)
 
 
 def dual_momentum_signal(prices, lookback, skip, holding):
     mom = prices.shift(skip) / prices.shift(lookback) - 1.0
-    pos = (mom > 0).astype(float)
-    long_w = pos.div(pos.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
-    w = long_w
-    return w.iloc[::holding].reindex(prices.index, method="ffill").fillna(0)
+    abs_pos = (mom > 0).astype(float)
+    ma = prices.rolling(lookback, min_periods=max(10, lookback // 3)).mean()
+    above = (prices > ma).astype(float)
+    long_mask = abs_pos * above
+    long_w = long_mask.div(long_mask.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
+    return long_w.iloc[::holding].reindex(prices.index, method="ffill").fillna(0)
 
 
 def trend_following_signal(prices, fast, slow, holding):
@@ -192,28 +220,77 @@ def trend_following_signal(prices, fast, slow, holding):
     ma_s = prices.rolling(slow, min_periods=max(3, slow // 2)).mean()
     sig = (ma_f > ma_s).astype(float)
     long_w = sig.div(sig.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
-    w = long_w
+    return long_w.iloc[::holding].reindex(prices.index, method="ffill").fillna(0)
+
+
+def short_term_reversal_signal(prices, lookback, holding, quantile, trend_window,
+                               uptrend=None):
+    ret = prices.pct_change(lookback)
+    ma = prices.rolling(trend_window, min_periods=max(10, trend_window // 3)).mean()
+    above = (prices > ma).astype(float)
+    ranks = ret.rank(axis=1, pct=True)
+    long_mask = (ranks <= quantile) & (above > 0)
+    short_mask = (ranks >= 1 - quantile) & (above < 1)
+    long_w = long_mask.div(long_mask.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
+    short_w = short_mask.div(short_mask.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
+    if uptrend is not None:
+        gate = 0.15 + 0.85 * (1.0 - uptrend)
+        short_w = short_w.mul(gate, axis=0)
+    w = long_w - 0.5 * short_w
     return w.iloc[::holding].reindex(prices.index, method="ffill").fillna(0)
 
 
+def cs_neutral_momentum_signal(prices, lookback, skip, holding, quantile, vol_window,
+                               uptrend=None):
+    mom = prices.shift(skip) / prices.shift(lookback) - 1.0
+    mom_neutral = mom.sub(mom.mean(axis=1), axis=0)
+    vol = mom_neutral.rolling(vol_window, min_periods=max(10, vol_window // 3)).std()
+    z = mom_neutral / vol.replace(0, np.nan)
+    ranks = z.rank(axis=1, pct=True)
+    long_mask = ranks >= 1 - quantile
+    short_mask = ranks <= quantile
+    long_w = long_mask.div(long_mask.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
+    short_w = short_mask.div(short_mask.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
+    if uptrend is not None:
+        gate = 0.15 + 0.85 * (1.0 - uptrend)
+        short_w = short_w.mul(gate, axis=0)
+    w = long_w - short_w
+    return w.iloc[::holding].reindex(prices.index, method="ffill").fillna(0)
+
+
+def pead_proxy_signal(prices, move_threshold, holding, trend_window):
+    ret = prices.pct_change()
+    big_pos = (ret > move_threshold).astype(float)
+    trend = (prices > prices.rolling(trend_window, min_periods=max(10, trend_window // 3)).mean()).astype(float)
+    active = (big_pos * trend).rolling(holding, min_periods=1).max().shift(1).fillna(0)
+    denom = active.sum(axis=1).replace(0, np.nan)
+    return active.div(denom, axis=0).fillna(0)
+
+
 STRATEGY_FUNCS = {
-    "momentum":        momentum_signal,
-    "q4_breakout":     q4_breakout_signal,
-    "turn_of_month":   turn_of_month_signal,
-    "mean_reversion":  mean_reversion_signal,
-    "low_vol":         low_vol_signal,
-    "dual_momentum":   dual_momentum_signal,
-    "trend_following": trend_following_signal,
+    "momentum":            ensemble_momentum,
+    "q4_breakout":         q4_breakout_signal,
+    "turn_of_month":       turn_of_month_signal,
+    "mean_reversion":      mean_reversion_signal,
+    "low_vol":             low_vol_signal,
+    "dual_momentum":       dual_momentum_signal,
+    "trend_following":     trend_following_signal,
+    "short_term_reversal": short_term_reversal_signal,
+    "cs_neutral_momentum": cs_neutral_momentum_signal,
+    "pead_proxy":          pead_proxy_signal,
 }
 
 BASE_ALLOC = {
-    "momentum":        0.20,
-    "q4_breakout":     0.15,
-    "turn_of_month":   0.10,
-    "mean_reversion":  0.10,
-    "low_vol":         0.15,
-    "dual_momentum":   0.15,
-    "trend_following": 0.15,
+    "momentum":            0.14,
+    "q4_breakout":         0.06,
+    "turn_of_month":       0.05,
+    "mean_reversion":      0.08,
+    "low_vol":             0.10,
+    "dual_momentum":       0.10,
+    "trend_following":     0.10,
+    "short_term_reversal": 0.12,
+    "cs_neutral_momentum": 0.15,
+    "pead_proxy":          0.10,
 }
 
 
@@ -221,32 +298,90 @@ def build_all_signals(prices, params, uptrend):
     out = {}
     for name, fn in STRATEGY_FUNCS.items():
         if name == "momentum":
+            out[name] = normalise(fn(prices, params[name], uptrend))
+        elif name in ("short_term_reversal", "cs_neutral_momentum"):
             out[name] = normalise(fn(prices, uptrend=uptrend, **params[name]))
         else:
             out[name] = normalise(fn(prices, **params[name]))
     return out
 
 
-def risk_parity_weights(strat_rets, ann, max_w=0.30, min_window=None):
-    if min_window is None:
-        min_window = max(30, int(ann * 0.5))
-    vols = strat_rets.rolling(min_window, min_periods=max(10, min_window // 3)).std()
-    inv = 1.0 / vols.replace(0, np.nan)
-    w = inv.div(inv.sum(axis=1).replace(0, np.nan), axis=0)
-    w = w.clip(upper=max_w)
-    w = w.div(w.sum(axis=1).replace(0, np.nan), axis=0)
-    return w.fillna(0).shift(1)
+def cross_sectional_ic(prices, weights, horizon, step=None):
+    if step is None:
+        step = max(1, horizon)
+    fwd = prices.shift(-horizon) / prices - 1.0
+    ics = []
+    for i in range(0, len(prices) - horizon, step):
+        sig = weights.iloc[i]
+        ret_fwd = fwd.iloc[i]
+        common = sig.dropna().index.intersection(ret_fwd.dropna().index)
+        common = common[sig[common].abs() > 1e-8]
+        if len(common) < 5:
+            continue
+        try:
+            ic = stats.spearmanr(sig[common].values, ret_fwd[common].values).correlation
+            if not np.isnan(ic):
+                ics.append(ic)
+        except Exception:
+            continue
+    if len(ics) == 0:
+        return np.nan, np.nan, 0
+    ics = np.array(ics)
+    mean_ic = float(np.nanmean(ics))
+    ir_ic = mean_ic / (np.nanstd(ics) / np.sqrt(len(ics))) if len(ics) > 1 else np.nan
+    return mean_ic, ir_ic, len(ics)
 
 
-def combine_signals(signals, rp_weights, base_alloc):
+def rolling_ic_weight(signals, prices, horizon, window_ic, step, min_obs=6):
+    fwd = prices.shift(-horizon) / prices - 1.0
+    rebal_idx = list(range(0, len(prices) - horizon, step))
+    if len(rebal_idx) == 0:
+        return pd.DataFrame(0.0, index=prices.index, columns=list(signals.keys()))
+    ic_records = {}
+    for name, w in signals.items():
+        ics = []
+        for i in rebal_idx:
+            sig = w.iloc[i]
+            rf = fwd.iloc[i]
+            common = sig.dropna().index.intersection(rf.dropna().index)
+            common = common[sig[common].abs() > 1e-8]
+            if len(common) < 5:
+                ics.append(np.nan)
+                continue
+            try:
+                v = stats.spearmanr(sig[common].values, rf[common].values).correlation
+            except Exception:
+                v = np.nan
+            ics.append(v)
+        ic_records[name] = pd.Series(ics, index=prices.index[rebal_idx])
+    ic_df = pd.DataFrame(ic_records)
+    ic_roll = ic_df.rolling(window_ic, min_periods=min_obs).mean()
+    ic_roll = ic_roll.clip(lower=0.0)
+    w = ic_roll.div(ic_roll.sum(axis=1).replace(0, np.nan), axis=0)
+    w = w.fillna(0)
+    w = w.reindex(prices.index, method="ffill").fillna(0)
+    return w.shift(1)
+
+
+def strategy_cs_ic_table(prices, signals, horizon, step):
+    rows = {}
+    for name, w in signals.items():
+        ic, ir, n = cross_sectional_ic(prices, w, horizon=horizon, step=step)
+        rows[name] = {"cs_ic": ic, "ic_ir": ir, "n_obs": n}
+    return pd.DataFrame(rows).T.sort_values("cs_ic", ascending=False)
+
+
+def combine_signals_ic(signals, ic_w):
     combined = None
     for name, w in signals.items():
-        if name in rp_weights.columns:
-            wt = rp_weights[name].reindex(w.index).fillna(0)
-        else:
-            wt = pd.Series(base_alloc.get(name, 0.0), index=w.index)
+        if name not in ic_w.columns:
+            continue
+        wt = ic_w[name].reindex(w.index).fillna(0)
         term = w.mul(wt, axis=0)
         combined = term if combined is None else combined + term
+    if combined is None:
+        first = next(iter(signals.values()))
+        return pd.DataFrame(0.0, index=first.index, columns=first.columns)
     return combined.fillna(0)
 
 
@@ -256,7 +391,7 @@ def apply_vol_target(weights, prices, ann, target=VOL_TARGET, max_lev=MAX_LEV):
     strat_ret = (prev_w * ret).sum(axis=1)
     window = max(20, int(ann * 0.25))
     realized = strat_ret.rolling(window, min_periods=max(10, window // 3)).std() * np.sqrt(ann)
-    scale = (target / realized).clip(upper=max_lev).shift(1).fillna(0)
+    scale = (target / realized).clip(upper=max_lev).shift(1).fillna(1.0)
     return weights.mul(scale, axis=0)
 
 
@@ -278,6 +413,27 @@ def max_streak(mask):
         else:
             cur = 0
     return best
+
+
+def deflated_sharpe_ratio(returns, ann, n_trials=100):
+    r = returns.dropna()
+    n = len(r)
+    if n < 30 or r.std() == 0:
+        return np.nan
+    sr_ann = r.mean() / r.std() * np.sqrt(ann)
+    sr_p = sr_ann / np.sqrt(ann)
+    skew = r.skew()
+    kurt = r.kurtosis() + 3.0
+    var_sr = (1 + 0.5 * sr_p**2 - skew * sr_p + (kurt - 3) / 4 * sr_p**2) / max(1, n - 1)
+    se = np.sqrt(var_sr)
+    if se == 0:
+        return np.nan
+    emc = 0.5772156649
+    z1 = stats.norm.ppf(1 - 1 / n_trials)
+    z2 = stats.norm.ppf(1 - 1 / (n_trials * np.e))
+    exp_max = (1 - emc) * z1 + emc * z2
+    dsr = stats.norm.cdf((sr_p - exp_max * se) / se)
+    return dsr
 
 
 def compute_metrics(returns, ann, benchmark=None, rf=0.02):
@@ -308,20 +464,19 @@ def compute_metrics(returns, ann, benchmark=None, rf=0.02):
     omega = wins.sum() / abs(losses.sum()) if losses.sum() != 0 else np.nan
     gain_to_pain = r.sum() / abs(losses.sum()) if losses.sum() != 0 else np.nan
     tail_ratio = np.percentile(r, 95) / abs(np.percentile(r, 5))
-    ic = np.nan
-    ir = np.nan
     beta = np.nan
     alpha = np.nan
+    ir = np.nan
     if benchmark is not None:
         b = benchmark.reindex(r.index).dropna()
         a = r.reindex(b.index)
         if len(a) > 5 and a.std() > 0 and b.std() > 0:
-            ic = a.corr(b)
             beta = a.cov(b) / b.var()
             alpha = (a.mean() - beta * b.mean()) * ann
         te = (a - b).std() * np.sqrt(ann)
         if te > 0:
             ir = (a.mean() - b.mean()) * ann / te
+    dsr = deflated_sharpe_ratio(r, ann, n_trials=100)
     return {
         "Total Return": total,
         "Annualised Return": ann_ret,
@@ -332,7 +487,7 @@ def compute_metrics(returns, ann, benchmark=None, rf=0.02):
         "Calmar Ratio": calmar,
         "Win Rate": win_rate,
         "Profit Factor": pf,
-        "Information Coefficient (IC)": ic,
+        "Deflated Sharpe Ratio": dsr,
         "Information Ratio (IR)": ir,
         "Alpha (ann.)": alpha,
         "Beta": beta,
@@ -352,102 +507,89 @@ def compute_metrics(returns, ann, benchmark=None, rf=0.02):
     }, dd
 
 
-def walk_forward_windows(n_bars, ann):
-    if n_bars < int(ann * 1.5):
-        return None
-    if n_bars >= int(ann * 5):
-        return int(ann * 3), int(ann * 1)
-    if n_bars >= int(ann * 3):
-        return int(ann * 1.5), int(ann * 0.5)
-    return int(ann * 1.0), int(ann * 0.25)
-
-
-def walk_forward(prices, params, ann, lookback_grid):
-    win = walk_forward_windows(len(prices), ann)
-    if win is None:
-        return pd.Series(dtype=float)
-    train_days, test_days = win
-    uptrend_full, _ = compute_regime(prices, ann)
-    oos = []
-    i = 0
-    while i + train_days + test_days <= len(prices):
-        tr_s, tr_e = i, i + train_days
-        te_s, te_e = tr_e, tr_e + test_days
-        best_sharpe, best_lb = -np.inf, lookback_grid[0]
-        for lb in lookback_grid:
-            local = dict(params)
-            m = dict(local["momentum"]); m["lookback"] = lb
-            local["momentum"] = m
-            d = dict(local["dual_momentum"]); d["lookback"] = lb
-            local["dual_momentum"] = d
-            uptrend_tr = uptrend_full.iloc[tr_s:tr_e]
-            sig = build_all_signals(prices.iloc[tr_s:tr_e], local, uptrend_tr)
-            ret = prices.iloc[tr_s:tr_e].pct_change().fillna(0)
-            sr = pd.DataFrame({k: (v.shift(1) * ret).sum(axis=1) for k, v in sig.items()})
-            rp = risk_parity_weights(sr, ann)
-            w = apply_vol_target(combine_signals(sig, rp, BASE_ALLOC), prices.iloc[tr_s:tr_e], ann)
-            r_tr, _ = backtest(prices.iloc[tr_s:tr_e], w)
-            r_tr = r_tr.dropna()
-            if len(r_tr) < 20 or r_tr.std() == 0:
-                continue
-            s = r_tr.mean() / r_tr.std() * np.sqrt(ann)
-            if s > best_sharpe:
-                best_sharpe, best_lb = s, lb
-        local = dict(params)
-        m = dict(local["momentum"]); m["lookback"] = best_lb
-        local["momentum"] = m
-        d = dict(local["dual_momentum"]); d["lookback"] = best_lb
-        local["dual_momentum"] = d
-        uptrend_te = uptrend_full.iloc[te_s:te_e]
-        sig = build_all_signals(prices.iloc[te_s:te_e], local, uptrend_te)
-        ret = prices.iloc[te_s:te_e].pct_change().fillna(0)
-        sr = pd.DataFrame({k: (v.shift(1) * ret).sum(axis=1) for k, v in sig.items()})
-        rp = risk_parity_weights(sr, ann)
-        w = apply_vol_target(combine_signals(sig, rp, BASE_ALLOC), prices.iloc[te_s:te_e], ann)
-        r_te, _ = backtest(prices.iloc[te_s:te_e], w)
-        oos.append(r_te)
-        i += test_days
-    return pd.concat(oos).sort_index() if oos else pd.Series(dtype=float)
-
-
-def monte_carlo_permutation(returns, ann, n_perm=1000, block=None):
+def monte_carlo_signflip(returns, ann, n_perm=2000):
     r = returns.dropna().values
     n = len(r)
-    if n < 20 or r.std() == 0:
+    if n < 30 or r.std() == 0:
         return np.nan, np.nan, np.array([])
-    if block is None:
-        block = max(5, int(np.sqrt(n)))
     obs = r.mean() / r.std() * np.sqrt(ann)
-    n_blocks = max(1, n // block)
     perm = np.empty(n_perm)
     for k in range(n_perm):
-        idx = np.random.randint(0, n - block + 1, size=n_blocks)
-        samp = np.concatenate([r[i:i + block] for i in idx])[:n]
-        if samp.std() == 0:
+        signs = np.random.choice([-1.0, 1.0], size=n)
+        rs = r * signs
+        if rs.std() == 0:
             perm[k] = np.nan
             continue
-        perm[k] = samp.mean() / samp.std() * np.sqrt(ann)
+        perm[k] = rs.mean() / rs.std() * np.sqrt(ann)
     perm = perm[~np.isnan(perm)]
     p = float((perm >= obs).mean()) if len(perm) > 0 else np.nan
     return p, obs, perm
 
 
+def cs_shuffle_placebo(prices, weights, ann, n_perm=200):
+    orig_r, _ = backtest(prices, weights)
+    orig_r = orig_r.dropna()
+    orig = orig_r.mean() / orig_r.std() * np.sqrt(ann) if orig_r.std() > 0 else np.nan
+    perm_sharpes = []
+    w_arr = weights.values.copy()
+    n_rows, n_cols = w_arr.shape
+    if n_cols < 2:
+        return orig, np.nan, np.array([])
+    for k in range(n_perm):
+        w_shuf = w_arr.copy()
+        for i in range(n_rows):
+            np.random.shuffle(w_shuf[i])
+        w_df = pd.DataFrame(w_shuf, index=weights.index, columns=weights.columns)
+        r, _ = backtest(prices, w_df)
+        r = r.dropna()
+        if len(r) > 20 and r.std() > 0:
+            perm_sharpes.append(r.mean() / r.std() * np.sqrt(ann))
+    perm_sharpes = np.array(perm_sharpes)
+    p = float((perm_sharpes >= orig).mean()) if len(perm_sharpes) > 0 else np.nan
+    return orig, p, perm_sharpes
+
+
+def time_shift_placebo(prices, weights, ann, shifts=(1, 5, 10, 21, 42, 63)):
+    orig_r, _ = backtest(prices, weights)
+    orig_r = orig_r.dropna()
+    orig = orig_r.mean() / orig_r.std() * np.sqrt(ann) if orig_r.std() > 0 else np.nan
+    out = {}
+    for s in shifts:
+        wp = weights.shift(s).fillna(0)
+        r, _ = backtest(prices, wp)
+        r = r.dropna()
+        out[s] = r.mean() / r.std() * np.sqrt(ann) if len(r) > 5 and r.std() > 0 else np.nan
+    return orig, out
+
+
+def signal_decay(prices, weights, ann, horizons=(1, 2, 5, 10, 21, 42)):
+    out = {}
+    for h in horizons:
+        w = weights.shift(h).fillna(0)
+        r, _ = backtest(prices, w)
+        r = r.dropna()
+        out[h] = r.mean() / r.std() * np.sqrt(ann) if len(r) > 5 and r.std() > 0 else np.nan
+    return out
+
+
 def parameter_robustness(prices, params, ann, uptrend, pct=0.2):
-    base_lb = params["momentum"]["lookback"]
-    lbs = sorted(set([max(20, int(base_lb * (1 - pct))), base_lb, int(base_lb * (1 + pct))]))
+    base_lbs = params["momentum"]["lookbacks"]
+    base_lb = base_lbs[len(base_lbs) // 2]
+    lbs = sorted(set([max(30, int(base_lb * (1 - pct))), base_lb, int(base_lb * (1 + pct))]))
     base_h = params["momentum"]["holding"]
     holds = sorted(set([max(2, int(base_h * (1 - pct))), base_h, int(base_h * (1 + pct))]))
     res = np.zeros((len(lbs), len(holds)))
+    horizon_ic = max(5, int(ann / 12))
+    step_ic = max(2, horizon_ic)
+    window_ic = max(8, int(ann * 0.5) // step_ic)
     for i, lb in enumerate(lbs):
         for j, h in enumerate(holds):
             local = dict(params)
-            m = dict(local["momentum"]); m["lookback"] = lb; m["holding"] = h
-            local["momentum"] = m
+            local["momentum"] = {"lookbacks": (lb,), "skip": params["momentum"]["skip"],
+                                 "holding": h, "quantile": params["momentum"]["quantile"]}
             sig = build_all_signals(prices, local, uptrend)
-            ret = prices.pct_change().fillna(0)
-            sr = pd.DataFrame({k: (v.shift(1) * ret).sum(axis=1) for k, v in sig.items()})
-            rp = risk_parity_weights(sr, ann)
-            w = apply_vol_target(combine_signals(sig, rp, BASE_ALLOC), prices, ann)
+            ic_w = rolling_ic_weight(sig, prices, horizon_ic, window_ic, step_ic)
+            w = apply_vol_target(combine_signals_ic(sig, ic_w), prices, ann)
             r, _ = backtest(prices, w)
             r = r.dropna()
             res[i, j] = r.mean() / r.std() * np.sqrt(ann) if len(r) > 5 and r.std() > 0 else np.nan
@@ -463,55 +605,81 @@ def cost_sensitivity(prices, weights, ann, bps_list=(0, 2, 5, 10, 20, 50)):
     return out
 
 
-def placebo_test(prices, weights, ann, shifts=(1, 5, 10, 21, 42, 63)):
-    orig_r, _ = backtest(prices, weights)
-    orig_r = orig_r.dropna()
-    orig = orig_r.mean() / orig_r.std() * np.sqrt(ann) if orig_r.std() > 0 else np.nan
-    out = {}
-    for s in shifts:
-        wp = weights.shift(s).fillna(0)
-        r, _ = backtest(prices, wp)
-        r = r.dropna()
-        out[s] = r.mean() / r.std() * np.sqrt(ann) if len(r) > 5 and r.std() > 0 else np.nan
-    return orig, out
+def walk_forward_windows(n_bars, ann):
+    if n_bars < int(ann * 1.5):
+        return None
+    if n_bars >= int(ann * 5):
+        return int(ann * 3), int(ann * 1)
+    if n_bars >= int(ann * 3):
+        return int(ann * 1.5), int(ann * 0.5)
+    return int(ann * 1.0), int(ann * 0.25)
 
 
-def one_shot_generalisation(prices, params, ann, uptrend, split=0.5,
-                            lookbacks=(63, 126, 189, 252, 378)):
+def walk_forward(prices, params, ann):
+    win = walk_forward_windows(len(prices), ann)
+    if win is None:
+        print("  [WF] history too short")
+        return pd.Series(dtype=float)
+    train_days, test_days = win
+    if test_days < 5:
+        test_days = 5
+    uptrend_full, _ = compute_regime(prices, ann)
+
+    horizon_ic = max(5, int(ann / 12))
+    step_ic = max(2, horizon_ic)
+    window_ic = max(8, int(ann * 0.5) // step_ic)
+
+    signals_full = build_all_signals(prices, params, uptrend_full)
+    ic_w_full = rolling_ic_weight(signals_full, prices, horizon_ic,
+                                  window_ic, step_ic)
+    raw_full = combine_signals_ic(signals_full, ic_w_full)
+    weights_full = apply_vol_target(raw_full, prices, ann)
+
+    oos = []
+    i = 0
+    while i + train_days + test_days <= len(prices):
+        te_s = i + train_days
+        te_e = te_s + test_days
+        w_te = weights_full.iloc[te_s:te_e]
+        r_te, _ = backtest(prices.iloc[te_s:te_e], w_te)
+        r_te = r_te.dropna()
+        if len(r_te) > 20:
+            oos.append(r_te)
+        i += test_days
+
+    if not oos:
+        print("  [WF] no valid OOS windows produced")
+        return pd.Series(dtype=float)
+    out = pd.concat(oos)
+    out = out[~out.index.duplicated(keep="first")].sort_index()
+    return out
+
+
+def one_shot_generalisation(prices, params, ann, uptrend, split=0.5):
     n = int(len(prices) * split)
     train = prices.iloc[:n]
     test = prices.iloc[n:]
-    best_sharpe, best_lb = -np.inf, lookbacks[0]
-    for lb in lookbacks:
-        local = dict(params)
-        m = dict(local["momentum"]); m["lookback"] = lb
-        local["momentum"] = m
-        up_tr = uptrend.iloc[:n]
-        sig = build_all_signals(train, local, up_tr)
-        ret = train.pct_change().fillna(0)
-        sr = pd.DataFrame({k: (v.shift(1) * ret).sum(axis=1) for k, v in sig.items()})
-        rp = risk_parity_weights(sr, ann)
-        w = apply_vol_target(combine_signals(sig, rp, BASE_ALLOC), train, ann)
-        r, _ = backtest(train, w)
-        r = r.dropna()
-        if len(r) < 20 or r.std() == 0:
-            continue
-        s = r.mean() / r.std() * np.sqrt(ann)
-        if s > best_sharpe:
-            best_sharpe, best_lb = s, lb
-    local = dict(params)
-    m = dict(local["momentum"]); m["lookback"] = best_lb
-    local["momentum"] = m
+
+    horizon_ic = max(5, int(ann / 12))
+    step_ic = max(2, horizon_ic)
+    window_ic = max(8, int(ann * 0.5) // step_ic)
+
+    up_tr = uptrend.iloc[:n]
+    sig_tr = build_all_signals(train, params, up_tr)
+    ic_w_tr = rolling_ic_weight(sig_tr, train, horizon_ic, window_ic, step_ic)
+    w_tr = apply_vol_target(combine_signals_ic(sig_tr, ic_w_tr), train, ann)
+    r_tr, _ = backtest(train, w_tr)
+    r_tr = r_tr.dropna()
+    train_sharpe = r_tr.mean() / r_tr.std() * np.sqrt(ann) if r_tr.std() > 0 else np.nan
+
     up_te = uptrend.iloc[n:]
-    sig = build_all_signals(test, local, up_te)
-    ret = test.pct_change().fillna(0)
-    sr = pd.DataFrame({k: (v.shift(1) * ret).sum(axis=1) for k, v in sig.items()})
-    rp = risk_parity_weights(sr, ann)
-    w = apply_vol_target(combine_signals(sig, rp, BASE_ALLOC), test, ann)
-    r, _ = backtest(test, w)
-    r = r.dropna()
-    test_sharpe = r.mean() / r.std() * np.sqrt(ann) if len(r) > 5 and r.std() > 0 else np.nan
-    return best_lb, best_sharpe, test_sharpe
+    sig_te = build_all_signals(test, params, up_te)
+    ic_w_te = rolling_ic_weight(sig_te, test, horizon_ic, window_ic, step_ic)
+    w_te = apply_vol_target(combine_signals_ic(sig_te, ic_w_te), test, ann)
+    r_te, _ = backtest(test, w_te)
+    r_te = r_te.dropna()
+    test_sharpe = r_te.mean() / r_te.std() * np.sqrt(ann) if r_te.std() > 0 else np.nan
+    return train_sharpe, test_sharpe
 
 
 def estimate_ann_factor(index, fallback):
@@ -559,9 +727,13 @@ def run_pipeline(universe_name, tf_name, tickers):
 
     signals = build_all_signals(prices, params, uptrend)
     ret = prices.pct_change().fillna(0)
-    strat_rets = pd.DataFrame({k: (v.shift(1) * ret).sum(axis=1) for k, v in signals.items()})
-    rp_w = risk_parity_weights(strat_rets, ann)
-    raw_w = combine_signals(signals, rp_w, BASE_ALLOC)
+
+    horizon_ic = max(5, int(ann / 12))
+    step_ic = max(2, horizon_ic)
+    window_ic = max(8, int(ann * 0.5) // step_ic)
+
+    ic_w = rolling_ic_weight(signals, prices, horizon_ic, window_ic, step_ic)
+    raw_w = combine_signals_ic(signals, ic_w)
     weights = apply_vol_target(raw_w, prices, ann)
 
     returns, turnover = backtest(prices, weights)
@@ -585,6 +757,18 @@ def run_pipeline(universe_name, tf_name, tickers):
     pd.DataFrame(metrics, index=["value"]).T.to_csv(os.path.join(out, "metrics_full.csv"))
     pd.DataFrame(strat_returns).to_csv(os.path.join(out, "strategy_returns.csv"))
 
+    mean_ic, ir_ic, n_ic = cross_sectional_ic(prices, weights, horizon=horizon_ic, step=step_ic)
+    print(f"\nCombined Cross-sectional IC (h={horizon_ic})  : {mean_ic: .4f}")
+    print(f"Combined IC Information Ratio                 : {ir_ic: .4f}")
+    print(f"IC observations                               : {n_ic}")
+    pd.Series({"mean_ic": mean_ic, "ic_ir": ir_ic, "n": n_ic}).to_csv(
+        os.path.join(out, "cross_sectional_ic.csv"))
+
+    ic_table = strategy_cs_ic_table(prices, signals, horizon=horizon_ic, step=step_ic)
+    print("\n--- Per-Strategy Cross-Sectional IC ---")
+    print(ic_table.round(4))
+    ic_table.to_csv(os.path.join(out, "strategy_cs_ic.csv"))
+
     strat_metrics = {}
     for name, r in strat_returns.items():
         sm, _ = compute_metrics(r, ann, bench_ret)
@@ -598,7 +782,7 @@ def run_pipeline(universe_name, tf_name, tickers):
     ax.plot(equity(bench_ret), label="EW Benchmark", lw=1.2, ls="--", alpha=0.8)
     ax.set_yscale("log")
     ax.set_title(f"[{tag}] Equity Curves (log)")
-    ax.legend(loc="upper left", fontsize=8)
+    ax.legend(loc="upper left", fontsize=7)
     save(fig, os.path.join(out, "01_equity.png"))
 
     fig, ax = plt.subplots(figsize=(13, 4.5))
@@ -670,14 +854,20 @@ def run_pipeline(universe_name, tf_name, tickers):
         m, _ = compute_metrics(r, ann, bench_ret)
         ax.annotate(name, (m["Annualised Volatility"], m["Annualised Return"]),
                     fontsize=7, alpha=0.75)
-    ax.set_xlabel("Annualised Volatility")
-    ax.set_ylabel("Annualised Return")
+    ax.set_xlabel("Annualised Volatility"); ax.set_ylabel("Annualised Return")
     ax.set_title(f"[{tag}] Risk-Return by Strategy")
     save(fig, os.path.join(out, "08_risk_return.png"))
 
-    print("\n--- Walk-Forward ---")
-    lb_grid = sorted(set([max(20, int(ann * x)) for x in (0.25, 0.5, 0.75, 1.0, 1.5)]))
-    wf_ret = walk_forward(prices, params, ann, lb_grid)
+    fig, ax = plt.subplots(figsize=(11, 5))
+    ic_table["cs_ic"].plot(kind="bar", ax=ax, color="steelblue", edgecolor="black")
+    ax.axhline(0, color="black", lw=0.8)
+    ax.axhline(0.03, color="green", lw=1.0, ls="--", label="Tradable IC threshold")
+    ax.set_title(f"[{tag}] Per-Strategy Cross-Sectional IC (h={horizon_ic})")
+    ax.legend()
+    save(fig, os.path.join(out, "16_strategy_cs_ic.png"))
+
+    print("\n--- Walk-Forward (full-history IC weights, sliced) ---")
+    wf_ret = walk_forward(prices, params, ann)
     if len(wf_ret) > 20:
         wf_m, wf_dd = compute_metrics(wf_ret, ann, bench_ret.reindex(wf_ret.index).fillna(0))
         for k, v in wf_m.items():
@@ -695,8 +885,8 @@ def run_pipeline(universe_name, tf_name, tickers):
         print("[WF] insufficient OOS returns")
         wf_m = {}
 
-    print("\n--- Monte Carlo ---")
-    p_val, obs_sharpe, perm = monte_carlo_permutation(returns, ann, 1000)
+    print("\n--- Monte Carlo (sign-flip, H0: mean=0) ---")
+    p_val, obs_sharpe, perm = monte_carlo_signflip(returns, ann, n_perm=2000)
     print(f"Observed Sharpe     : {obs_sharpe:.4f}")
     print(f"p-value             : {p_val:.4f}")
     if len(perm) > 0:
@@ -707,11 +897,30 @@ def run_pipeline(universe_name, tf_name, tickers):
             os.path.join(out, "monte_carlo.csv"))
         fig, ax = plt.subplots(figsize=(11, 5))
         ax.hist(perm, bins=min(60, max(10, len(perm) // 10)),
-                color="lightgray", edgecolor="black", alpha=0.85, label="Null")
+                color="lightgray", edgecolor="black", alpha=0.85, label="Null (sign-flip)")
         ax.axvline(obs_sharpe, color="red", lw=2.2, label=f"Observed = {obs_sharpe:.2f}")
-        ax.set_title(f"[{tag}] Monte Carlo (p = {p_val:.4f})")
+        ax.set_title(f"[{tag}] Monte Carlo sign-flip (p = {p_val:.4f})")
         ax.legend()
         save(fig, os.path.join(out, "10_monte_carlo.png"))
+
+    print("\n--- Cross-sectional shuffle placebo ---")
+    orig_s, cs_p, cs_perm = cs_shuffle_placebo(prices, weights, ann, n_perm=200)
+    print(f"Original Sharpe     : {orig_s:.4f}")
+    print(f"CS-shuffle p-value  : {cs_p:.4f}")
+    if len(cs_perm) > 0:
+        print(f"CS Null 95% CI      : [{np.percentile(cs_perm, 2.5):.4f}, {np.percentile(cs_perm, 97.5):.4f}]")
+        pd.Series({"p_value": cs_p, "orig_sharpe": orig_s,
+                   "ci_lo": np.percentile(cs_perm, 2.5),
+                   "ci_hi": np.percentile(cs_perm, 97.5)}).to_csv(
+            os.path.join(out, "cs_placebo.csv"))
+        fig, ax = plt.subplots(figsize=(11, 5))
+        ax.hist(cs_perm, bins=min(60, max(10, len(cs_perm) // 10)),
+                color="lightsteelblue", edgecolor="black", alpha=0.85,
+                label="Null (cross-sectional shuffle)")
+        ax.axvline(orig_s, color="red", lw=2.2, label=f"Observed = {orig_s:.2f}")
+        ax.set_title(f"[{tag}] CS-shuffle placebo (p = {cs_p:.4f})")
+        ax.legend()
+        save(fig, os.path.join(out, "10b_cs_placebo.png"))
 
     print("\n--- Parameter Robustness ---")
     lbs, holds, rob = parameter_robustness(prices, params, ann, uptrend)
@@ -747,33 +956,47 @@ def run_pipeline(universe_name, tf_name, tickers):
     ax.set_title(f"[{tag}] Cost Sensitivity")
     save(fig, os.path.join(out, "12_cost_sensitivity.png"))
 
-    print("\n--- Placebo Test ---")
-    orig_s, placebo = placebo_test(prices, weights, ann)
-    print(f"Original Sharpe : {orig_s:.4f}")
+    print("\n--- Time-shift placebo ---")
+    orig_s2, placebo = time_shift_placebo(prices, weights, ann)
+    print(f"Original Sharpe : {orig_s2:.4f}")
     for k, v in placebo.items():
         print(f"Shift {k:3d} : Sharpe {v: .4f}")
-    pd.Series(placebo).to_csv(os.path.join(out, "placebo.csv"))
+    pd.Series(placebo).to_csv(os.path.join(out, "time_shift_placebo.csv"))
+
+    print("\n--- Signal decay ---")
+    decay = signal_decay(prices, weights, ann)
+    for k, v in decay.items():
+        print(f"Lag {k:3d} : Sharpe {v: .4f}")
+    pd.Series(decay).to_csv(os.path.join(out, "signal_decay.csv"))
+
     fig, ax = plt.subplots(figsize=(10, 5))
     labels = ["Original"] + [f"+{k}" for k in placebo.keys()]
-    vals = [orig_s] + list(placebo.values())
+    vals = [orig_s2] + list(placebo.values())
     colors = ["black"] + ["gray"] * len(placebo)
     ax.bar(labels, vals, color=colors, edgecolor="black")
     ax.axhline(0, color="red", lw=0.8)
     for i, v in enumerate(vals):
         if not np.isnan(v):
             ax.text(i, v, f"{v:.2f}", ha="center", va="bottom", fontsize=9)
-    ax.set_title(f"[{tag}] Placebo Test")
-    save(fig, os.path.join(out, "13_placebo.png"))
+    ax.set_title(f"[{tag}] Time-shift placebo")
+    save(fig, os.path.join(out, "13_time_shift_placebo.png"))
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ks = list(decay.keys()); vs = list(decay.values())
+    ax.plot(ks, vs, marker="o", color="black", lw=1.6)
+    ax.axhline(0, color="red", lw=0.8)
+    ax.set_xlabel("Signal->Return lag (periods)")
+    ax.set_ylabel("Sharpe")
+    ax.set_title(f"[{tag}] Signal Decay")
+    save(fig, os.path.join(out, "14_signal_decay.png"))
 
     print("\n--- One-Shot Generalisation ---")
-    best_lb, train_s, test_s = one_shot_generalisation(prices, params, ann, uptrend)
-    print(f"Best lookback on train : {best_lb}")
+    train_s, test_s = one_shot_generalisation(prices, params, ann, uptrend)
     print(f"Train Sharpe           : {train_s:.4f}")
     print(f"Test Sharpe (frozen)   : {test_s:.4f}")
     print(f"Degradation            : {train_s - test_s:.4f}")
-    pd.Series({"best_lookback": best_lb, "train_sharpe": train_s,
-               "test_sharpe": test_s, "degradation": train_s - test_s}
-              ).to_csv(os.path.join(out, "one_shot.csv"))
+    pd.Series({"train_sharpe": train_s, "test_sharpe": test_s,
+               "degradation": train_s - test_s}).to_csv(os.path.join(out, "one_shot.csv"))
     fig, ax = plt.subplots(figsize=(7, 5))
     ax.bar(["Train", "Test (frozen)"], [train_s, test_s],
            color=["steelblue", "darkorange"], edgecolor="black")
@@ -782,7 +1005,7 @@ def run_pipeline(universe_name, tf_name, tickers):
             ax.text(i, v, f"{v:.2f}", ha="center", va="bottom", fontsize=10)
     ax.set_ylabel("Sharpe")
     ax.set_title(f"[{tag}] One-Shot Generalisation")
-    save(fig, os.path.join(out, "14_one_shot.png"))
+    save(fig, os.path.join(out, "15_one_shot.png"))
 
     pd.DataFrame({"Full Sample": pd.Series(metrics),
                   "Walk-Forward": pd.Series(wf_m) if wf_m else np.nan}).to_csv(
@@ -791,25 +1014,27 @@ def run_pipeline(universe_name, tf_name, tickers):
     with open(os.path.join(out, "config.json"), "w") as f:
         json.dump({"universe": universe_name, "timeframe": tf_name,
                    "tickers": list(prices.columns), "ann_factor": ann,
-                   "base_alloc": BASE_ALLOC, "params": params,
+                   "base_alloc": BASE_ALLOC,
+                   "params": {k: (v if not isinstance(v, tuple) else list(v))
+                              for k, v in params.items()},
                    "vol_target": VOL_TARGET, "max_lev": MAX_LEV},
                   f, indent=2, default=str)
 
     result = {
         "universe": universe_name, "timeframe": tf_name,
-        "n_tickers": prices.shape[1], "n_bars": len(prices),
-        "ann_factor": ann,
+        "n_tickers": prices.shape[1], "n_bars": len(prices), "ann_factor": ann,
         "sharpe": metrics.get("Sharpe Ratio", np.nan),
         "ann_return": metrics.get("Annualised Return", np.nan),
         "max_dd": metrics.get("Max Drawdown", np.nan),
         "sortino": metrics.get("Sortino Ratio", np.nan),
         "calmar": metrics.get("Calmar Ratio", np.nan),
-        "ic": metrics.get("Information Coefficient (IC)", np.nan),
+        "dsr": metrics.get("Deflated Sharpe Ratio", np.nan),
+        "cs_ic": mean_ic, "ic_ir": ir_ic,
         "ir": metrics.get("Information Ratio (IR)", np.nan),
         "alpha": metrics.get("Alpha (ann.)", np.nan),
         "beta": metrics.get("Beta", np.nan),
         "wf_sharpe": wf_m.get("Sharpe Ratio", np.nan) if wf_m else np.nan,
-        "mc_p": p_val,
+        "mc_p": p_val, "cs_p": cs_p,
     }
     print(f"\n[DONE] {tag} saved to {out}")
     return result
@@ -852,12 +1077,27 @@ def main():
         ax.legend()
         save(fig, os.path.join(BASE_OUT, "00_overall_summary.png"))
 
-        fig, ax = plt.subplots(figsize=(14, 6))
-        ax.bar(labels, [r["max_dd"] for r in results], color="crimson", edgecolor="black")
+        fig, ax = plt.subplots(figsize=(14, 5))
+        ax.bar(x - 0.2, [r["mc_p"] for r in results], 0.4,
+               label="MC sign-flip p", color="crimson")
+        ax.bar(x + 0.2, [r["cs_p"] for r in results], 0.4,
+               label="CS-shuffle p", color="navy")
+        ax.axhline(0.05, color="green", lw=1.2, ls="--", label="0.05")
+        ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=7)
+        ax.set_ylabel("p-value")
+        ax.set_title("Cross-Run Statistical Significance")
+        ax.legend()
+        save(fig, os.path.join(BASE_OUT, "00_overall_pvalues.png"))
+
+        fig, ax = plt.subplots(figsize=(14, 5))
+        ax.bar(labels, [r["cs_ic"] for r in results], color="purple", edgecolor="black")
+        ax.axhline(0, color="black", lw=0.8)
+        ax.axhline(0.03, color="green", lw=1.0, ls="--", label="Tradable IC")
         ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
-        ax.set_ylabel("Max Drawdown")
-        ax.set_title("Cross-Run Max Drawdown")
-        save(fig, os.path.join(BASE_OUT, "00_overall_drawdown.png"))
+        ax.set_ylabel("Cross-Sectional IC")
+        ax.set_title("Cross-Run CS-IC (combined signal)")
+        ax.legend()
+        save(fig, os.path.join(BASE_OUT, "00_overall_csic.png"))
 
     print(f"\nAll outputs saved to ./{BASE_OUT}/")
 
