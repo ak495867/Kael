@@ -14,6 +14,7 @@ Ten strategies from the Pareto frontier, each explained with formulas, a flow di
 |8|[MACD\_37\_97\_41](Strategies/MACD_37_97_41.md)|`MACD(37, 97, 41)`|1|+0.731|
 |9|[WMA\_CCI](Strategies/WMA_CCI.md)|`WMA(CCI(21), 113)`|2|+0.198|
 |10|[STD\_SLOPE](Strategies/STD_SLOPE.md)|`ROLL\_SLOPE(STD(close, 24), 95)`|3|-0.071|
+| 11 | [KRM_ESC](Research/KRM_ESC.md) | Kramers escape-rate breakout (physics-derived, **untested**) | n/a | not run |
 
 ## Common conventions
 
