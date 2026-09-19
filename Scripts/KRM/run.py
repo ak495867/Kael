@@ -89,6 +89,7 @@ def main() -> None:
 
     bench_close = frames[args.bench]["Adj Close"] if args.bench in frames else next(iter(frames.values()))["Adj Close"]
     ew = {}
+    summary = []
     for tk in [t for t in frames if t in args.tickers or args.self_test]:
         df = frames[tk]
         print("\n" + "=" * 78 + f"\n{tk}: {df.index[0].date()} -> {df.index[-1].date()}  ({len(df)} rows)  split={split.date()}\n" + "=" * 78)
@@ -129,8 +130,29 @@ def main() -> None:
         show("BENCHMARK buy & hold (OOS)", R["benchmark_buy_hold"])
         print(f"  corr(strategy, buy&hold) = {R['corr_with_buy_hold']:+.3f}")
 
+        summary.append(dict(
+            ticker=tk, is_sharpe=R["headline"].loc["in_sample", "sharpe"], oos_sharpe=R["headline"].loc["out_of_sample", "sharpe"],
+            buy_hold=R["benchmark_buy_hold"]["sharpe"], placebo_p=R["placebo"]["p_value"], psr=R["psr_vs_0"],
+            no_gate=R["ablation"].loc["gate_removed (Lambda=1)", "sharpe"],
+            param_verdict=R.get("param_sensitivity", {}).get("verdict", "n/a")))
         R["_daily"].to_csv(os.path.join(args.out, f"daily_{tk}.csv"))
         ew[tk] = R["_daily"].loc[R["_daily"].index >= split, "net"]
+
+    if summary:
+        tab = pd.DataFrame(summary).set_index("ticker")
+        tab.to_csv(os.path.join(args.out, "summary.csv"))
+        n = len(tab)
+        gate_helps = int((tab["oos_sharpe"] > tab["no_gate"]).sum())
+        sig = int((tab["placebo_p"] < 0.05).sum())
+        print("\n" + "=" * 78 + "\nSUMMARY ACROSS TICKERS (OOS, lag={}, cost={} bps)\n".format(args.lag, args.cost_bps) + "=" * 78)
+        print(tab.to_string())
+        print(f"\n  median OOS Sharpe            : {tab['oos_sharpe'].median():+.3f}")
+        print(f"  mean OOS Sharpe              : {tab['oos_sharpe'].mean():+.3f}")
+        print(f"  OOS Sharpe > 0               : {int((tab['oos_sharpe'] > 0).sum())}/{n}")
+        print(f"  placebo p < 0.05             : {sig}/{n}   (about {0.05 * n:.1f} expected by chance alone)")
+        print(f"  physics gate beats no-gate   : {gate_helps}/{n}")
+        ok = tab["oos_sharpe"].median() > 0 and sig >= max(1, int(np.ceil(0.25 * n)))
+        print(f"  pre-declared bar (median OOS Sharpe > 0 AND placebo p<0.05 in >=25% of tickers): {'PASS' if ok else 'FAIL'}")
 
     if len(ew) > 1:
         port = pd.concat(ew, axis=1).dropna().mean(axis=1)
