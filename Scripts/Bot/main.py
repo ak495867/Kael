@@ -33,14 +33,15 @@ UNIVERSES = {
     ],
     "crypto": [
         "BTC-USD","ETH-USD","BNB-USD","SOL-USD","XRP-USD","ADA-USD",
-        "DOGE-USD","DOT-USD","LTC-USD","LINK-USD","MATIC-USD","AVAX-USD",
-        "ATOM-USD","UNI-USD","XLM-USD"
+        "DOGE-USD","DOT-USD","LTC-USD","LINK-USD","AVAX-USD","ATOM-USD",
+        "NEAR-USD","ALGO-USD","APT-USD"
+    ],
+    "treasuries_and_credit": [
+        "SHY","IEI","IEF","TLH","TLT","TIP","LQD","HYG","EMB","MBB","AGG"
     ],
     "mixed_assets": [
         "SPY","QQQ","IWM","TLT","IEF","LQD","HYG","GLD","SLV","USO",
-        "DBC","VNQ","EFA","EEM","FXI","EWJ","BTC-USD","ETH-USD",
-        "AAPL","MSFT","NVDA","TSLA","JPM","XOM","PG","WMT","KO","DIS",
-        "XLK","XLF","XLE","XLV","XLU","GLD","TLT","SLV","USO","DBA"
+        "DBC","VNQ","EFA","EEM","FXI","EWJ","BTC-USD","ETH-USD"
     ],
 }
 
@@ -51,29 +52,30 @@ TIMEFRAMES = {
 }
 
 RUNS = [
-    ("us_equities",  "1d"),
-    ("sector_etfs",  "1d"),
-    ("international","1d"),
-    ("crypto",       "1d"),
-    ("mixed_assets", "1d"),
-    ("sector_etfs",  "1h"),
-    ("crypto",       "1h"),
-    ("mixed_assets", "1h"),
-    ("us_equities",  "1wk"),
-    ("sector_etfs",  "1wk"),
+    ("us_equities",            "1d"),
+    ("sector_etfs",            "1d"),
+    ("international",          "1d"),
+    ("crypto",                 "1d"),
+    ("treasuries_and_credit",  "1d"),
+    ("mixed_assets",           "1d"),
+    ("sector_etfs",            "1h"),
+    ("crypto",                 "1h"),
+    ("mixed_assets",           "1h"),
+    ("us_equities",            "1wk"),
+    ("sector_etfs",            "1wk"),
 ]
 
 START = "2018-01-01"
 END   = pd.Timestamp.today().strftime("%Y-%m-%d")
+VOL_TARGET = 0.12
+MAX_LEV = 2.0
 
 
 def download_data(tickers, tf_cfg, start, end):
-    interval = tf_cfg["interval"]
-    period = tf_cfg.get("period")
-    kwargs = dict(tickers=tickers, interval=interval, auto_adjust=True,
+    kwargs = dict(tickers=tickers, interval=tf_cfg["interval"], auto_adjust=True,
                   progress=False, group_by="column", threads=True)
-    if period:
-        kwargs["period"] = period
+    if tf_cfg.get("period"):
+        kwargs["period"] = tf_cfg["period"]
     else:
         kwargs["start"] = start
         kwargs["end"] = end
@@ -88,7 +90,7 @@ def download_data(tickers, tf_cfg, start, end):
     data = data.loc[:, data.notna().mean() > 0.85]
     if data.index.tz is not None:
         data.index = data.index.tz_convert("UTC").tz_localize(None)
-    if interval in ("1d", "1wk", "1mo"):
+    if tf_cfg["interval"] in ("1d", "1wk", "1mo"):
         data = data.loc[data.index.dayofweek < 5]
     data = data.ffill().dropna(how="any")
     return data
@@ -99,28 +101,40 @@ def normalise(w):
     return w.div(denom, axis=0).fillna(0)
 
 
+def compute_regime(prices, ann):
+    window = max(30, int(0.8 * ann))
+    bench = prices.mean(axis=1)
+    ma = bench.rolling(window, min_periods=max(10, window // 4)).mean()
+    uptrend = (bench > ma).astype(float)
+    return uptrend, bench
+
+
 def scaled_params(ann):
     s = ann / 252.0
     def sv(x, lo):
         return max(lo, int(round(x * s)))
     return {
-        "momentum":        {"lookback": sv(252, 30), "skip": sv(21, 2), "holding": sv(21, 2), "quantile": 0.2},
-        "q4_breakout":     {"high_window": sv(252, 30), "hold_days": sv(21, 2)},
+        "momentum":        {"lookback": sv(252, 40), "skip": sv(21, 3), "holding": sv(21, 3), "quantile": 0.2},
+        "q4_breakout":     {"high_window": sv(252, 40), "hold_days": sv(21, 3)},
         "turn_of_month":   {"pre_days": 2, "post_days": 3},
         "mean_reversion":  {"lookback": sv(5, 2), "holding": sv(5, 2), "quantile": 0.2},
-        "low_vol":         {"lookback": sv(63, 10), "holding": sv(21, 2), "quantile": 0.3},
-        "dual_momentum":   {"lookback": sv(126, 20), "skip": sv(21, 2), "holding": sv(21, 2)},
-        "trend_following": {"fast": sv(20, 3), "slow": sv(100, 8), "holding": sv(5, 1)},
+        "low_vol":         {"lookback": sv(63, 15), "holding": sv(21, 3), "quantile": 0.3},
+        "dual_momentum":   {"lookback": sv(126, 30), "skip": sv(21, 3), "holding": sv(21, 3)},
+        "trend_following": {"fast": sv(20, 4), "slow": sv(100, 12), "holding": sv(5, 1)},
     }
 
 
-def momentum_signal(prices, lookback, skip, holding, quantile):
+def momentum_signal(prices, lookback, skip, holding, quantile, uptrend=None, short_cap=0.3):
     mom = prices.shift(skip) / prices.shift(lookback) - 1.0
     ranks = mom.rank(axis=1, pct=True)
     long_mask = ranks >= (1 - quantile)
     short_mask = ranks <= quantile
     long_w = long_mask.div(long_mask.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
     short_w = short_mask.div(short_mask.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
+    if uptrend is not None:
+        gate = 0.2 + 0.8 * (1.0 - uptrend)
+        short_w = short_w.mul(gate, axis=0)
+    short_w = short_w * short_cap
     w = long_w - short_w
     return w.iloc[::holding].reindex(prices.index, method="ffill").fillna(0)
 
@@ -151,10 +165,8 @@ def mean_reversion_signal(prices, lookback, holding, quantile):
     ret = prices.pct_change(lookback)
     ranks = ret.rank(axis=1, pct=True)
     long_mask = ranks <= quantile
-    short_mask = ranks >= (1 - quantile)
     long_w = long_mask.div(long_mask.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
-    short_w = short_mask.div(short_mask.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
-    w = long_w - short_w
+    w = long_w
     return w.iloc[::holding].reindex(prices.index, method="ffill").fillna(0)
 
 
@@ -162,32 +174,25 @@ def low_vol_signal(prices, lookback, holding, quantile):
     vol = prices.pct_change().rolling(lookback).std()
     ranks = vol.rank(axis=1, pct=True)
     long_mask = ranks <= quantile
-    short_mask = ranks >= (1 - quantile)
     long_w = long_mask.div(long_mask.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
-    short_w = short_mask.div(short_mask.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
-    w = long_w - short_w
+    w = long_w
     return w.iloc[::holding].reindex(prices.index, method="ffill").fillna(0)
 
 
 def dual_momentum_signal(prices, lookback, skip, holding):
     mom = prices.shift(skip) / prices.shift(lookback) - 1.0
     pos = (mom > 0).astype(float)
-    neg = (mom < 0).astype(float)
     long_w = pos.div(pos.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
-    short_w = neg.div(neg.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
-    w = long_w - short_w
+    w = long_w
     return w.iloc[::holding].reindex(prices.index, method="ffill").fillna(0)
 
 
 def trend_following_signal(prices, fast, slow, holding):
     ma_f = prices.rolling(fast, min_periods=max(2, fast // 2)).mean()
     ma_s = prices.rolling(slow, min_periods=max(3, slow // 2)).mean()
-    sig = (ma_f > ma_s).astype(float) - (ma_f < ma_s).astype(float)
-    long_mask = (sig > 0)
-    short_mask = (sig < 0)
-    long_w = long_mask.div(long_mask.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
-    short_w = short_mask.div(short_mask.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
-    w = long_w - short_w
+    sig = (ma_f > ma_s).astype(float)
+    long_w = sig.div(sig.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
+    w = long_w
     return w.iloc[::holding].reindex(prices.index, method="ffill").fillna(0)
 
 
@@ -201,32 +206,58 @@ STRATEGY_FUNCS = {
     "trend_following": trend_following_signal,
 }
 
-ALLOCATIONS = {
+BASE_ALLOC = {
     "momentum":        0.20,
-    "q4_breakout":     0.12,
+    "q4_breakout":     0.15,
     "turn_of_month":   0.10,
-    "mean_reversion":  0.15,
-    "low_vol":         0.13,
+    "mean_reversion":  0.10,
+    "low_vol":         0.15,
     "dual_momentum":   0.15,
     "trend_following": 0.15,
 }
 
 
-def build_all_signals(prices, params):
+def build_all_signals(prices, params, uptrend):
     out = {}
     for name, fn in STRATEGY_FUNCS.items():
-        out[name] = normalise(fn(prices, **params[name]))
+        if name == "momentum":
+            out[name] = normalise(fn(prices, uptrend=uptrend, **params[name]))
+        else:
+            out[name] = normalise(fn(prices, **params[name]))
     return out
 
 
-def combine_signals(signals, allocations):
-    total = sum(allocations.values())
+def risk_parity_weights(strat_rets, ann, max_w=0.30, min_window=None):
+    if min_window is None:
+        min_window = max(30, int(ann * 0.5))
+    vols = strat_rets.rolling(min_window, min_periods=max(10, min_window // 3)).std()
+    inv = 1.0 / vols.replace(0, np.nan)
+    w = inv.div(inv.sum(axis=1).replace(0, np.nan), axis=0)
+    w = w.clip(upper=max_w)
+    w = w.div(w.sum(axis=1).replace(0, np.nan), axis=0)
+    return w.fillna(0).shift(1)
+
+
+def combine_signals(signals, rp_weights, base_alloc):
     combined = None
     for name, w in signals.items():
-        a = allocations.get(name, 0.0) / total
-        term = w * a
+        if name in rp_weights.columns:
+            wt = rp_weights[name].reindex(w.index).fillna(0)
+        else:
+            wt = pd.Series(base_alloc.get(name, 0.0), index=w.index)
+        term = w.mul(wt, axis=0)
         combined = term if combined is None else combined + term
     return combined.fillna(0)
+
+
+def apply_vol_target(weights, prices, ann, target=VOL_TARGET, max_lev=MAX_LEV):
+    ret = prices.pct_change().fillna(0)
+    prev_w = weights.shift(1).fillna(0)
+    strat_ret = (prev_w * ret).sum(axis=1)
+    window = max(20, int(ann * 0.25))
+    realized = strat_ret.rolling(window, min_periods=max(10, window // 3)).std() * np.sqrt(ann)
+    scale = (target / realized).clip(upper=max_lev).shift(1).fillna(0)
+    return weights.mul(scale, axis=0)
 
 
 def backtest(prices, weights, cost_bps=0.0):
@@ -235,7 +266,7 @@ def backtest(prices, weights, cost_bps=0.0):
     gross = (w * ret).sum(axis=1)
     turnover = weights.diff().abs().sum(axis=1).shift(1).fillna(0)
     cost = turnover * cost_bps / 10000.0
-    return (gross - cost), turnover
+    return gross - cost, turnover
 
 
 def max_streak(mask):
@@ -279,11 +310,15 @@ def compute_metrics(returns, ann, benchmark=None, rf=0.02):
     tail_ratio = np.percentile(r, 95) / abs(np.percentile(r, 5))
     ic = np.nan
     ir = np.nan
+    beta = np.nan
+    alpha = np.nan
     if benchmark is not None:
         b = benchmark.reindex(r.index).dropna()
         a = r.reindex(b.index)
         if len(a) > 5 and a.std() > 0 and b.std() > 0:
             ic = a.corr(b)
+            beta = a.cov(b) / b.var()
+            alpha = (a.mean() - beta * b.mean()) * ann
         te = (a - b).std() * np.sqrt(ann)
         if te > 0:
             ir = (a.mean() - b.mean()) * ann / te
@@ -299,6 +334,8 @@ def compute_metrics(returns, ann, benchmark=None, rf=0.02):
         "Profit Factor": pf,
         "Information Coefficient (IC)": ic,
         "Information Ratio (IR)": ir,
+        "Alpha (ann.)": alpha,
+        "Beta": beta,
         "VaR 95%": var95,
         "CVaR 95%": cvar95,
         "Skewness": skew,
@@ -315,11 +352,25 @@ def compute_metrics(returns, ann, benchmark=None, rf=0.02):
     }, dd
 
 
-def walk_forward(prices, params, ann, train_days, test_days, lookback_grid):
-    n = len(prices)
+def walk_forward_windows(n_bars, ann):
+    if n_bars < int(ann * 1.5):
+        return None
+    if n_bars >= int(ann * 5):
+        return int(ann * 3), int(ann * 1)
+    if n_bars >= int(ann * 3):
+        return int(ann * 1.5), int(ann * 0.5)
+    return int(ann * 1.0), int(ann * 0.25)
+
+
+def walk_forward(prices, params, ann, lookback_grid):
+    win = walk_forward_windows(len(prices), ann)
+    if win is None:
+        return pd.Series(dtype=float)
+    train_days, test_days = win
+    uptrend_full, _ = compute_regime(prices, ann)
     oos = []
     i = 0
-    while i + train_days + test_days <= n:
+    while i + train_days + test_days <= len(prices):
         tr_s, tr_e = i, i + train_days
         te_s, te_e = tr_e, tr_e + test_days
         best_sharpe, best_lb = -np.inf, lookback_grid[0]
@@ -329,9 +380,13 @@ def walk_forward(prices, params, ann, train_days, test_days, lookback_grid):
             local["momentum"] = m
             d = dict(local["dual_momentum"]); d["lookback"] = lb
             local["dual_momentum"] = d
-            sig_tr = build_all_signals(prices.iloc[tr_s:tr_e], local)
-            w_tr = combine_signals(sig_tr, ALLOCATIONS)
-            r_tr, _ = backtest(prices.iloc[tr_s:tr_e], w_tr)
+            uptrend_tr = uptrend_full.iloc[tr_s:tr_e]
+            sig = build_all_signals(prices.iloc[tr_s:tr_e], local, uptrend_tr)
+            ret = prices.iloc[tr_s:tr_e].pct_change().fillna(0)
+            sr = pd.DataFrame({k: (v.shift(1) * ret).sum(axis=1) for k, v in sig.items()})
+            rp = risk_parity_weights(sr, ann)
+            w = apply_vol_target(combine_signals(sig, rp, BASE_ALLOC), prices.iloc[tr_s:tr_e], ann)
+            r_tr, _ = backtest(prices.iloc[tr_s:tr_e], w)
             r_tr = r_tr.dropna()
             if len(r_tr) < 20 or r_tr.std() == 0:
                 continue
@@ -343,29 +398,43 @@ def walk_forward(prices, params, ann, train_days, test_days, lookback_grid):
         local["momentum"] = m
         d = dict(local["dual_momentum"]); d["lookback"] = best_lb
         local["dual_momentum"] = d
-        sig_te = build_all_signals(prices.iloc[te_s:te_e], local)
-        w_te = combine_signals(sig_te, ALLOCATIONS)
-        r_te, _ = backtest(prices.iloc[te_s:te_e], w_te)
+        uptrend_te = uptrend_full.iloc[te_s:te_e]
+        sig = build_all_signals(prices.iloc[te_s:te_e], local, uptrend_te)
+        ret = prices.iloc[te_s:te_e].pct_change().fillna(0)
+        sr = pd.DataFrame({k: (v.shift(1) * ret).sum(axis=1) for k, v in sig.items()})
+        rp = risk_parity_weights(sr, ann)
+        w = apply_vol_target(combine_signals(sig, rp, BASE_ALLOC), prices.iloc[te_s:te_e], ann)
+        r_te, _ = backtest(prices.iloc[te_s:te_e], w)
         oos.append(r_te)
         i += test_days
     return pd.concat(oos).sort_index() if oos else pd.Series(dtype=float)
 
 
-def monte_carlo_permutation(returns, ann, n_perm=1000):
+def monte_carlo_permutation(returns, ann, n_perm=1000, block=None):
     r = returns.dropna().values
-    if len(r) < 10 or r.std() == 0:
+    n = len(r)
+    if n < 20 or r.std() == 0:
         return np.nan, np.nan, np.array([])
+    if block is None:
+        block = max(5, int(np.sqrt(n)))
     obs = r.mean() / r.std() * np.sqrt(ann)
+    n_blocks = max(1, n // block)
     perm = np.empty(n_perm)
     for k in range(n_perm):
-        s = np.random.permutation(r)
-        perm[k] = s.mean() / s.std() * np.sqrt(ann)
-    return float((perm >= obs).mean()), obs, perm
+        idx = np.random.randint(0, n - block + 1, size=n_blocks)
+        samp = np.concatenate([r[i:i + block] for i in idx])[:n]
+        if samp.std() == 0:
+            perm[k] = np.nan
+            continue
+        perm[k] = samp.mean() / samp.std() * np.sqrt(ann)
+    perm = perm[~np.isnan(perm)]
+    p = float((perm >= obs).mean()) if len(perm) > 0 else np.nan
+    return p, obs, perm
 
 
-def parameter_robustness(prices, params, ann, pct=0.2):
-    base = params["momentum"]["lookback"]
-    lbs = sorted(set([max(20, int(base * (1 - pct))), base, int(base * (1 + pct))]))
+def parameter_robustness(prices, params, ann, uptrend, pct=0.2):
+    base_lb = params["momentum"]["lookback"]
+    lbs = sorted(set([max(20, int(base_lb * (1 - pct))), base_lb, int(base_lb * (1 + pct))]))
     base_h = params["momentum"]["holding"]
     holds = sorted(set([max(2, int(base_h * (1 - pct))), base_h, int(base_h * (1 + pct))]))
     res = np.zeros((len(lbs), len(holds)))
@@ -374,8 +443,11 @@ def parameter_robustness(prices, params, ann, pct=0.2):
             local = dict(params)
             m = dict(local["momentum"]); m["lookback"] = lb; m["holding"] = h
             local["momentum"] = m
-            sig = build_all_signals(prices, local)
-            w = combine_signals(sig, ALLOCATIONS)
+            sig = build_all_signals(prices, local, uptrend)
+            ret = prices.pct_change().fillna(0)
+            sr = pd.DataFrame({k: (v.shift(1) * ret).sum(axis=1) for k, v in sig.items()})
+            rp = risk_parity_weights(sr, ann)
+            w = apply_vol_target(combine_signals(sig, rp, BASE_ALLOC), prices, ann)
             r, _ = backtest(prices, w)
             r = r.dropna()
             res[i, j] = r.mean() / r.std() * np.sqrt(ann) if len(r) > 5 and r.std() > 0 else np.nan
@@ -404,7 +476,8 @@ def placebo_test(prices, weights, ann, shifts=(1, 5, 10, 21, 42, 63)):
     return orig, out
 
 
-def one_shot_generalisation(prices, params, ann, split=0.5, lookbacks=(63, 126, 189, 252, 378)):
+def one_shot_generalisation(prices, params, ann, uptrend, split=0.5,
+                            lookbacks=(63, 126, 189, 252, 378)):
     n = int(len(prices) * split)
     train = prices.iloc[:n]
     test = prices.iloc[n:]
@@ -413,8 +486,12 @@ def one_shot_generalisation(prices, params, ann, split=0.5, lookbacks=(63, 126, 
         local = dict(params)
         m = dict(local["momentum"]); m["lookback"] = lb
         local["momentum"] = m
-        sig = build_all_signals(train, local)
-        w = combine_signals(sig, ALLOCATIONS)
+        up_tr = uptrend.iloc[:n]
+        sig = build_all_signals(train, local, up_tr)
+        ret = train.pct_change().fillna(0)
+        sr = pd.DataFrame({k: (v.shift(1) * ret).sum(axis=1) for k, v in sig.items()})
+        rp = risk_parity_weights(sr, ann)
+        w = apply_vol_target(combine_signals(sig, rp, BASE_ALLOC), train, ann)
         r, _ = backtest(train, w)
         r = r.dropna()
         if len(r) < 20 or r.std() == 0:
@@ -425,8 +502,12 @@ def one_shot_generalisation(prices, params, ann, split=0.5, lookbacks=(63, 126, 
     local = dict(params)
     m = dict(local["momentum"]); m["lookback"] = best_lb
     local["momentum"] = m
-    sig = build_all_signals(test, local)
-    w = combine_signals(sig, ALLOCATIONS)
+    up_te = uptrend.iloc[n:]
+    sig = build_all_signals(test, local, up_te)
+    ret = test.pct_change().fillna(0)
+    sr = pd.DataFrame({k: (v.shift(1) * ret).sum(axis=1) for k, v in sig.items()})
+    rp = risk_parity_weights(sr, ann)
+    w = apply_vol_target(combine_signals(sig, rp, BASE_ALLOC), test, ann)
     r, _ = backtest(test, w)
     r = r.dropna()
     test_sharpe = r.mean() / r.std() * np.sqrt(ann) if len(r) > 5 and r.std() > 0 else np.nan
@@ -469,21 +550,27 @@ def run_pipeline(universe_name, tf_name, tickers):
 
     ann = estimate_ann_factor(prices.index, tf["ann"])
     params = scaled_params(ann)
+    uptrend, bench_price = compute_regime(prices, ann)
 
     print(f"Tickers   : {prices.shape[1]}")
     print(f"Bars      : {len(prices)}")
     print(f"Span      : {prices.index[0]} -> {prices.index[-1]}")
     print(f"Ann factor: {ann:.1f}")
 
-    signals = build_all_signals(prices, params)
-    weights = combine_signals(signals, ALLOCATIONS)
+    signals = build_all_signals(prices, params, uptrend)
+    ret = prices.pct_change().fillna(0)
+    strat_rets = pd.DataFrame({k: (v.shift(1) * ret).sum(axis=1) for k, v in signals.items()})
+    rp_w = risk_parity_weights(strat_rets, ann)
+    raw_w = combine_signals(signals, rp_w, BASE_ALLOC)
+    weights = apply_vol_target(raw_w, prices, ann)
+
     returns, turnover = backtest(prices, weights)
     returns = returns.dropna()
     if len(returns) < 50:
         print(f"[SKIP] {tag}: not enough returns")
         return None
 
-    bench_ret = prices.pct_change().mean(axis=1).reindex(returns.index).dropna()
+    bench_ret = ret.mean(axis=1).reindex(returns.index).fillna(0)
 
     strat_returns = {}
     for name, w in signals.items():
@@ -519,8 +606,8 @@ def run_pipeline(universe_name, tf_name, tickers):
     ax.set_title(f"[{tag}] Drawdown")
     save(fig, os.path.join(out, "02_drawdown.png"))
 
-    roll_sharpe = returns.rolling(min(126, max(20, len(returns) // 4))).mean() / \
-                  returns.rolling(min(126, max(20, len(returns) // 4))).std() * np.sqrt(ann)
+    rwin = min(126, max(20, len(returns) // 4))
+    roll_sharpe = returns.rolling(rwin).mean() / returns.rolling(rwin).std() * np.sqrt(ann)
     fig, ax = plt.subplots(figsize=(13, 4.5))
     ax.plot(roll_sharpe, color="navy", lw=1.4)
     ax.axhline(0, color="black", lw=0.8)
@@ -529,7 +616,8 @@ def run_pipeline(universe_name, tf_name, tickers):
     ax.set_title(f"[{tag}] Rolling Sharpe")
     save(fig, os.path.join(out, "03_rolling_sharpe.png"))
 
-    roll_vol = returns.rolling(min(63, max(10, len(returns) // 6))).std() * np.sqrt(ann)
+    vwin = min(63, max(10, len(returns) // 6))
+    roll_vol = returns.rolling(vwin).std() * np.sqrt(ann)
     fig, ax = plt.subplots(figsize=(13, 4.5))
     ax.plot(roll_vol, color="darkorange", lw=1.4)
     ax.set_title(f"[{tag}] Rolling Annualised Volatility")
@@ -557,15 +645,17 @@ def run_pipeline(universe_name, tf_name, tickers):
         save(fig, os.path.join(out, "05_monthly_heatmap.png"))
 
     fig, ax = plt.subplots(figsize=(11, 5))
-    ax.hist(returns.values, bins=80, color="steelblue", edgecolor="black", alpha=0.8)
+    ax.hist(returns.values, bins=min(80, max(10, len(returns) // 10)),
+            color="steelblue", edgecolor="black", alpha=0.8)
     ax.axvline(np.percentile(returns, 5), color="red", ls="--", lw=1.5, label="VaR 95%")
     ax.axvline(returns.mean(), color="black", lw=1.5, label="Mean")
     ax.set_title(f"[{tag}] Return Distribution")
     ax.legend()
     save(fig, os.path.join(out, "06_distribution.png"))
 
+    tw = max(2, min(21, len(turnover) // 8))
     fig, ax = plt.subplots(figsize=(13, 4))
-    ax.plot(turnover.rolling(max(2, min(21, len(turnover) // 8))).mean(), color="purple", lw=1.4)
+    ax.plot(turnover.rolling(tw).mean(), color="purple", lw=1.4)
     ax.set_title(f"[{tag}] Rolling Avg Turnover")
     save(fig, os.path.join(out, "07_turnover.png"))
 
@@ -586,46 +676,45 @@ def run_pipeline(universe_name, tf_name, tickers):
     save(fig, os.path.join(out, "08_risk_return.png"))
 
     print("\n--- Walk-Forward ---")
-    train_days = int(ann * 3)
-    test_days = int(ann * 1)
-    if len(prices) > train_days + test_days + 20:
-        lb_grid = sorted(set([max(20, int(ann * x)) for x in (0.25, 0.5, 0.75, 1.0, 1.5)]))
-        wf_ret = walk_forward(prices, params, ann, train_days, test_days, lb_grid)
-        if len(wf_ret) > 20:
-            wf_m, wf_dd = compute_metrics(wf_ret, ann, bench_ret.reindex(wf_ret.index).dropna())
-            for k, v in wf_m.items():
-                print(f"{k:32s}: {v: .4f}")
-            pd.DataFrame(wf_m, index=["value"]).T.to_csv(os.path.join(out, "metrics_walkforward.csv"))
-            fig, axes = plt.subplots(2, 1, figsize=(13, 8), gridspec_kw={"height_ratios": [2, 1]})
-            axes[0].plot(equity(wf_ret), color="black", lw=2, label="WF OOS")
-            axes[0].plot(equity(bench_ret.reindex(wf_ret.index).fillna(0)), ls="--", label="Bench")
-            axes[0].set_yscale("log")
-            axes[0].set_title(f"[{tag}] Walk-Forward Equity")
-            axes[0].legend()
-            axes[1].fill_between(wf_dd.index, wf_dd.values, 0, color="crimson", alpha=0.7)
-            save(fig, os.path.join(out, "09_walkforward.png"))
-        else:
-            print("[WF] insufficient OOS returns")
+    lb_grid = sorted(set([max(20, int(ann * x)) for x in (0.25, 0.5, 0.75, 1.0, 1.5)]))
+    wf_ret = walk_forward(prices, params, ann, lb_grid)
+    if len(wf_ret) > 20:
+        wf_m, wf_dd = compute_metrics(wf_ret, ann, bench_ret.reindex(wf_ret.index).fillna(0))
+        for k, v in wf_m.items():
+            print(f"{k:32s}: {v: .4f}")
+        pd.DataFrame(wf_m, index=["value"]).T.to_csv(os.path.join(out, "metrics_walkforward.csv"))
+        fig, axes = plt.subplots(2, 1, figsize=(13, 8), gridspec_kw={"height_ratios": [2, 1]})
+        axes[0].plot(equity(wf_ret), color="black", lw=2, label="WF OOS")
+        axes[0].plot(equity(bench_ret.reindex(wf_ret.index).fillna(0)), ls="--", label="Bench")
+        axes[0].set_yscale("log")
+        axes[0].set_title(f"[{tag}] Walk-Forward Equity")
+        axes[0].legend()
+        axes[1].fill_between(wf_dd.index, wf_dd.values, 0, color="crimson", alpha=0.7)
+        save(fig, os.path.join(out, "09_walkforward.png"))
     else:
-        print("[WF] history too short")
+        print("[WF] insufficient OOS returns")
+        wf_m = {}
 
     print("\n--- Monte Carlo ---")
     p_val, obs_sharpe, perm = monte_carlo_permutation(returns, ann, 1000)
     print(f"Observed Sharpe     : {obs_sharpe:.4f}")
     print(f"p-value             : {p_val:.4f}")
-    print(f"Null 95% CI         : [{np.percentile(perm, 2.5):.4f}, {np.percentile(perm, 97.5):.4f}]")
-    pd.Series({"p_value": p_val, "obs_sharpe": obs_sharpe,
-               "ci_lo": np.percentile(perm, 2.5), "ci_hi": np.percentile(perm, 97.5)}
-              ).to_csv(os.path.join(out, "monte_carlo.csv"))
-    fig, ax = plt.subplots(figsize=(11, 5))
-    ax.hist(perm, bins=60, color="lightgray", edgecolor="black", alpha=0.85, label="Null")
-    ax.axvline(obs_sharpe, color="red", lw=2.2, label=f"Observed = {obs_sharpe:.2f}")
-    ax.set_title(f"[{tag}] Monte Carlo (p = {p_val:.4f})")
-    ax.legend()
-    save(fig, os.path.join(out, "10_monte_carlo.png"))
+    if len(perm) > 0:
+        print(f"Null 95% CI         : [{np.percentile(perm, 2.5):.4f}, {np.percentile(perm, 97.5):.4f}]")
+        pd.Series({"p_value": p_val, "obs_sharpe": obs_sharpe,
+                   "ci_lo": np.percentile(perm, 2.5),
+                   "ci_hi": np.percentile(perm, 97.5)}).to_csv(
+            os.path.join(out, "monte_carlo.csv"))
+        fig, ax = plt.subplots(figsize=(11, 5))
+        ax.hist(perm, bins=min(60, max(10, len(perm) // 10)),
+                color="lightgray", edgecolor="black", alpha=0.85, label="Null")
+        ax.axvline(obs_sharpe, color="red", lw=2.2, label=f"Observed = {obs_sharpe:.2f}")
+        ax.set_title(f"[{tag}] Monte Carlo (p = {p_val:.4f})")
+        ax.legend()
+        save(fig, os.path.join(out, "10_monte_carlo.png"))
 
     print("\n--- Parameter Robustness ---")
-    lbs, holds, rob = parameter_robustness(prices, params, ann)
+    lbs, holds, rob = parameter_robustness(prices, params, ann, uptrend)
     rob_df = pd.DataFrame(rob, index=[f"lookback={x}" for x in lbs],
                           columns=[f"hold={x}" for x in holds])
     print(rob_df.round(3))
@@ -677,7 +766,7 @@ def run_pipeline(universe_name, tf_name, tickers):
     save(fig, os.path.join(out, "13_placebo.png"))
 
     print("\n--- One-Shot Generalisation ---")
-    best_lb, train_s, test_s = one_shot_generalisation(prices, params, ann)
+    best_lb, train_s, test_s = one_shot_generalisation(prices, params, ann, uptrend)
     print(f"Best lookback on train : {best_lb}")
     print(f"Train Sharpe           : {train_s:.4f}")
     print(f"Test Sharpe (frozen)   : {test_s:.4f}")
@@ -695,17 +784,16 @@ def run_pipeline(universe_name, tf_name, tickers):
     ax.set_title(f"[{tag}] One-Shot Generalisation")
     save(fig, os.path.join(out, "14_one_shot.png"))
 
-    summary = pd.DataFrame({
-        "Full Sample": pd.Series(metrics),
-    })
-    summary.to_csv(os.path.join(out, "summary.csv"))
+    pd.DataFrame({"Full Sample": pd.Series(metrics),
+                  "Walk-Forward": pd.Series(wf_m) if wf_m else np.nan}).to_csv(
+        os.path.join(out, "summary.csv"))
 
     with open(os.path.join(out, "config.json"), "w") as f:
-        json.dump({
-            "universe": universe_name, "timeframe": tf_name,
-            "tickers": list(prices.columns), "ann_factor": ann,
-            "allocations": ALLOCATIONS, "params": params
-        }, f, indent=2, default=str)
+        json.dump({"universe": universe_name, "timeframe": tf_name,
+                   "tickers": list(prices.columns), "ann_factor": ann,
+                   "base_alloc": BASE_ALLOC, "params": params,
+                   "vol_target": VOL_TARGET, "max_lev": MAX_LEV},
+                  f, indent=2, default=str)
 
     result = {
         "universe": universe_name, "timeframe": tf_name,
@@ -716,6 +804,11 @@ def run_pipeline(universe_name, tf_name, tickers):
         "max_dd": metrics.get("Max Drawdown", np.nan),
         "sortino": metrics.get("Sortino Ratio", np.nan),
         "calmar": metrics.get("Calmar Ratio", np.nan),
+        "ic": metrics.get("Information Coefficient (IC)", np.nan),
+        "ir": metrics.get("Information Ratio (IR)", np.nan),
+        "alpha": metrics.get("Alpha (ann.)", np.nan),
+        "beta": metrics.get("Beta", np.nan),
+        "wf_sharpe": wf_m.get("Sharpe Ratio", np.nan) if wf_m else np.nan,
         "mc_p": p_val,
     }
     print(f"\n[DONE] {tag} saved to {out}")
@@ -743,20 +836,23 @@ def main():
         print("=" * 74)
         print(df.to_string(index=False))
 
-        fig, ax = plt.subplots(figsize=(13, 6))
         labels = [f"{r['universe']}\n{r['timeframe']}" for r in results]
         x = np.arange(len(labels))
-        w = 0.35
-        ax.bar(x - w / 2, [r["sharpe"] for r in results], w, label="Sharpe", color="steelblue")
-        ax.bar(x + w / 2, [r["sortino"] for r in results], w, label="Sortino", color="darkorange")
+
+        fig, ax = plt.subplots(figsize=(14, 6))
+        w = 0.25
+        ax.bar(x - w, [r["sharpe"] for r in results], w, label="Sharpe", color="steelblue")
+        ax.bar(x, [r["sortino"] for r in results], w, label="Sortino", color="darkorange")
+        ax.bar(x + w, [r["wf_sharpe"] for r in results], w, label="WF Sharpe", color="seagreen")
         ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=7)
         ax.axhline(0, color="black", lw=0.8)
+        ax.axhline(1, color="green", lw=0.8, ls="--")
         ax.set_ylabel("Ratio")
-        ax.set_title("Cross-Run Sharpe / Sortino Comparison")
+        ax.set_title("Cross-Run Sharpe / Sortino / WF-Sharpe")
         ax.legend()
         save(fig, os.path.join(BASE_OUT, "00_overall_summary.png"))
 
-        fig, ax = plt.subplots(figsize=(13, 6))
+        fig, ax = plt.subplots(figsize=(14, 6))
         ax.bar(labels, [r["max_dd"] for r in results], color="crimson", edgecolor="black")
         ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
         ax.set_ylabel("Max Drawdown")
