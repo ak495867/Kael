@@ -1,0 +1,4 @@
+numpy>=1.24
+pandas>=2.0
+yfinance>=0.2.40   # only needed to download data; use --csv to skip
+pytest>=7          # optional, for tests/
